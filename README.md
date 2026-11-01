@@ -27,13 +27,13 @@ Prompt Library is an extension and custom node for [ComfyUI] that automatically 
    ```
 2. Clone this repository:
    ```sh
-   git clone https://github.com/iamthroot/prompt_library.git prompt_library
+   git clone https://github.com/iamthroot/Prompt-Library.git Prompt-Library
    ```
 3. Restart ComfyUI.
 
 ### Option 2: Download Release ZIP
 
-1. Go to the [Releases](https://github.com/IAmThroot/prompt_library/releases) page.
+1. Go to the [Releases](https://github.com/IAmThroot/Prompt-Library/releases) page.
 2. Download the latest `prompt_library.zip`.
 3. Extract the ZIP into your ComfyUI `custom_nodes/` directory so the folder structure is:
    ```text
