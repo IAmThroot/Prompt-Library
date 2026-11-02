@@ -45,7 +45,7 @@ async def prompt_files(request):
 
 @routes.get("/prompt_library/thumb/{id}")
 async def thumb(request):
-    path = db.thumb_path(_int(request.match_info["id"], 0))
+    path = await asyncio.to_thread(db.thumb_path, _int(request.match_info["id"], 0))
     if not await asyncio.to_thread(db.valid_thumb,path):
         return web.Response(status=404)
     return web.FileResponse(path, headers={"Cache-Control": "max-age=86400"})
@@ -118,6 +118,8 @@ def guarded(fn):
     async def wrapped(request):
         try:
             return await fn(request)
+        except service.JobCapacityError as exc:
+            return web.json_response({'error': str(exc)}, status=429, headers={'Retry-After': '30'})
         except KeyError:
             return _error('Not found',404)
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc:
@@ -174,7 +176,7 @@ async def selection(request):
 @guarded
 async def bulk(request):
     body = await _body(request)
-    return web.json_response(await asyncio.to_thread(library.bulk,body.get('selection',{}),body.get('action'),body.get('value')))
+    return web.json_response(await asyncio.to_thread(library.bulk,body.get('selection'),body.get('action'),body.get('value')))
 
 
 @routes.get('/prompt_library/workflows/{id}')
@@ -208,15 +210,19 @@ async def media(request):
     return web.FileResponse(path,headers={'Cache-Control':'no-store'})
 
 
+def _fallback_preview(aid):
+    with db.db() as conn:
+        row = conn.execute('SELECT prompt_id FROM generations WHERE asset_id=? ORDER BY id DESC LIMIT 1', (aid,)).fetchone()
+    return db.thumb_path(row[0]) if row else ''
+
+
 @routes.get('/prompt_library/preview/{id}')
 @guarded
 async def preview(request):
     aid = request.match_info['id']
-    path = library.asset_thumb(aid)
+    path = await asyncio.to_thread(library.asset_thumb, aid)
     if not await asyncio.to_thread(db.valid_thumb,path):
-        with db.db() as conn:
-            row = conn.execute('SELECT prompt_id FROM generations WHERE asset_id=? ORDER BY id DESC LIMIT 1',(aid,)).fetchone()
-        path = db.thumb_path(row[0]) if row else ''
+        path = await asyncio.to_thread(_fallback_preview, aid)
     if not await asyncio.to_thread(db.valid_thumb,path):
         return web.Response(status=404)
     return web.FileResponse(path)
@@ -226,7 +232,7 @@ async def preview(request):
 @guarded
 async def export(request):
     selection = await _body(request)
-    jid = service.submit('export',lambda jid: archives.export_archive(service.job_file(jid,'.zip'),selection))
+    jid = await asyncio.to_thread(service.submit, 'export',lambda jid: archives.export_archive(service.job_file(jid,'.zip'),selection))
     return web.json_response({'job':jid})
 
 
@@ -234,28 +240,30 @@ async def export(request):
 @guarded
 async def import_preview(request):
     token = library.uid()
-    path = service.job_file(token,'.upload')
+    jid = await asyncio.to_thread(service.reserve, 'import_preview', upload=token)
+    path = await asyncio.to_thread(service.job_file, token, '.upload')
     limit = (await asyncio.to_thread(library.settings))['archive_max_mb']*1024**2
     size = 0
+    output = None
     try:
-        with open(path,'wb') as output:
-            async for chunk in request.content.iter_chunked(1024*1024):
-                size += len(chunk)
-                if size > limit:
-                    raise ValueError('Archive exceeds upload limit')
-                await asyncio.to_thread(output.write,chunk)
+        output = await asyncio.to_thread(open, path, 'wb')
+        async for chunk in request.content.iter_chunked(1024*1024):
+            size += len(chunk)
+            if size > limit:
+                raise ValueError('Archive exceeds upload limit')
+            await asyncio.to_thread(output.write, chunk)
+        await asyncio.to_thread(output.close)
+        output = None
         def inspect(jid):
-            try:
-                report = archives.preview_import(path)
-                report['upload'] = token
-                return report
-            except Exception:
-                path.unlink(missing_ok=True)
-                raise
-        jid = service.submit('import_preview',inspect)
+            report = archives.preview_import(path)
+            report['upload'] = token
+            return service.compact_report(report, service.job_file(jid, '.json'))
+        await asyncio.to_thread(service.submit, 'import_preview', inspect, jid=jid)
         return web.json_response({'job':jid})
-    except Exception:
-        path.unlink(missing_ok=True)
+    except BaseException:
+        if output:
+            await asyncio.to_thread(output.close)
+        await asyncio.to_thread(service.fail, jid, 'Upload interrupted or rejected')
         raise
 
 
@@ -263,31 +271,31 @@ async def import_preview(request):
 @guarded
 async def import_commit(request):
     body = await _body(request)
-    preview = service.job(body.get('preview_job'))
+    preview = await asyncio.to_thread(service.job, body.get('preview_job'))
     if preview['kind']!='import_preview' or preview['state']!='complete':
         raise ValueError('Preview this archive before importing it')
-    path = service.job_file(preview['result']['upload'],'.upload')
+    path = await asyncio.to_thread(service.job_file, preview['result']['upload'], '.upload')
     def commit(jid):
-        report = archives.import_archive(path,service.job_file(jid,'.json'))
-        return report
-    return web.json_response({'job':service.submit('import',commit)})
+        report = archives.import_archive(path, service.job_file(jid, '.json'))
+        return service.report_summary(report)
+    return web.json_response({'job':await asyncio.to_thread(service.submit, 'import', commit, dependencies=[preview['id']])})
 
 
 @routes.get('/prompt_library/jobs/{id}')
 @guarded
 async def job(request):
-    return web.json_response(service.job(request.match_info['id']))
+    return web.json_response(await asyncio.to_thread(service.job, request.match_info['id']))
 
 
 @routes.get('/prompt_library/jobs/{id}/download')
 @guarded
 async def job_download(request):
     jid = request.match_info['id']
-    job = service.job(jid)
+    job = await asyncio.to_thread(service.job, jid)
     if job['state']!='complete':
         raise ValueError('Job is not complete')
     suffix = '.zip' if job['kind']=='export' else '.json'
-    path = service.job_file(jid,suffix)
+    path = await asyncio.to_thread(service.job_file, jid, suffix)
     if not path.is_file():
         raise KeyError(jid)
     return web.FileResponse(path,headers={'Content-Disposition':'attachment; filename="prompt-library'+suffix+'"'})
@@ -302,7 +310,7 @@ async def backups(request):
 @routes.post('/prompt_library/backups')
 @guarded
 async def backup(request):
-    return web.json_response({'job':service.submit('backup',lambda jid:archives.create_backup())})
+    return web.json_response({'job':await asyncio.to_thread(service.submit, 'backup', lambda jid:archives.create_backup())})
 
 
 @routes.get('/prompt_library/backups/{id}/download')
@@ -318,4 +326,4 @@ async def restore(request):
     if (await _body(request)).get('confirm') is not True:
         raise ValueError('Confirm replacement of the library before restoring')
     bid = request.match_info['id']
-    return web.json_response({'job':service.submit('restore',lambda jid:archives.restore_backup(bid))})
+    return web.json_response({'job':await asyncio.to_thread(service.submit, 'restore', lambda jid:archives.restore_backup(bid))})

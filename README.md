@@ -1,13 +1,15 @@
 # Prompt Library for ComfyUI
 
-Prompt Library is an extension and custom node for [ComfyUI] that automatically indexes prompts, parameters, and workflows from your generated media (images, video, and audio). It maintains an independent, searchable SQLite database of your generation history so your prompts and workflows remain accessible even after output files are deleted or moved.
+**Version 1.1.0**
+
+Prompt Library is an extension and custom node for [ComfyUI](https://github.com/Comfy-Org/ComfyUI) that automatically indexes prompts, parameters, and workflows from your generated media (images, video, and audio). It maintains an independent, searchable SQLite database of your generation history so your prompts and workflows remain accessible even after output files are deleted or moved.
 
 ---
 
 ## Features
 
 - **Automatic Background Capture**: Recursively scans your ComfyUI `output/` folder in the background (configurable interval, default 30s) independent of open browser sessions.
-- **Robust Metadata Extraction**: Resolves positive and negative conditioning chains across standard CLIP text encoders, multi-stage pipelines, LoRA loaders, and modern video/multimodal architectures (e.g., MiniMax H3, Krea2, Flux2 Klein, Painter Flux).
+- **Robust Metadata Extraction**: Resolves positive and negative conditioning chains across standard CLIP text encoders, multi-stage pipelines, LoRA loaders, and modern video/multimodal architectures (e.g., MiniMax H3, Krea, Flux Klein, LTX, MOSS Image).
 - **Workflow Snapshots & Tab Isolation**: Saves entire canvas workflow graphs alongside extracted prompts. Open snapshots in temporary workflow tabs without altering or overwriting your active canvas graph.
 - **Independent Storage**: Your library is stored in SQLite WAL format under `ComfyUI/user/prompt_library/`. Deleting, moving, or cleaning up generated output media never removes your prompts or workflow records.
 - **Media Gallery & Playback**: View images and stream HTML5 video and audio directly in the ComfyUI interface with cached thumbnails and decoded video frame previews.
@@ -27,14 +29,14 @@ Prompt Library is an extension and custom node for [ComfyUI] that automatically 
    ```
 2. Clone this repository:
    ```sh
-   git clone https://github.com/iamthroot/Prompt-Library.git Prompt-Library
+   git clone https://github.com/IAmThroot/Prompt-Library.git prompt_library
    ```
 3. Restart ComfyUI.
 
 ### Option 2: Download Release ZIP
 
 1. Go to the [Releases](https://github.com/IAmThroot/Prompt-Library/releases) page.
-2. Download the latest `prompt_library.zip`.
+2. Download `prompt_library.zip` from the latest release (v1.1).
 3. Extract the ZIP into your ComfyUI `custom_nodes/` directory so the folder structure is:
    ```text
    ComfyUI/
@@ -131,8 +133,10 @@ python -m unittest discover -s tests -v
 
 ### Syntax and Compilation Verification
 ```sh
-python -m compileall -q __init__.py nodes.py db.py extract.py routes.py scanner.py service.py archives.py library.py
+python -m compileall -q __init__.py nodes.py db.py extract.py routes.py scanner.py service.py archives.py library.py validation.py
 node --input-type=module --check < web/prompt_library.js
+node --input-type=module --check < web/lifecycle.js
+node --experimental-vm-modules --test tests/test_frontend.mjs
 ```
 
 ### Output Folder Audit Tool (Optional)
@@ -143,6 +147,27 @@ python tools/audit_outputs.py /path/to/ComfyUI/output --roundtrip --report /tmp/
 
 ---
 
-## License
+## Safety, recovery, and resource limits
 
-This project is licensed under the MIT License.
+External media links require two settings: enable **Follow linked files and folders**, then add each permitted external directory under **Allowed external folders**, one absolute path per line. With traversal disabled, both file and folder symlinks are skipped. Internal links remain supported when traversal is enabled. Removing an allowed folder revokes access to its original media; saved prompts, workflows, and cached previews remain in the library. Disabling capture also prevents automatic scanning on restart.
+
+**Portable exports** and **recovery backups** serve different purposes:
+
+- Export/import uses the existing portable ZIP format for sharing selected entries. Portable manifests are limited to 64 MiB and individual previews to 2 MiB, in addition to the configured compressed and expanded archive limits. Oversized exports fail without publishing a partial archive; export a smaller selection or increase the applicable archive limit.
+- New local backups use recovery format v2: a SQLite snapshot plus checksummed previews and a compact manifest. Local restore does not apply portable upload limits. Existing v1 local backups remain restorable. Restore from the backup catalogue in **Settings and backups**; recovery-v2 files are not accepted by portable import. Manual and safety backups are not automatically pruned.
+- Backup publication follows validation. Restore keeps a safety backup and rolls back database and preview changes if recovery fails.
+
+Background jobs use one worker with at most 32 active/queued/uploading jobs. Terminal jobs and their files are retained for up to 24 hours, with at most 1,000 job records and an 8 GiB budget for job artifacts and upload/output reservations. Old terminal artifacts may be reclaimed earlier to make room; active jobs and their inputs are protected. Recovery backups are outside this temporary-job budget. Full conflict reports are stored on disk (up to 256 MiB); the UI shows at most 100 conflicts with long fields shortened. Download the full report before it expires. Interrupted jobs are marked failed after restart and are not automatically replayed.
+
+For API clients, bulk operations must explicitly supply exactly one selection form: `{"ids":[1,2]}` or `{"filters":{"search":"portrait"}}`. Missing or malformed selections return HTTP 400. Empty IDs affect nothing; explicit empty filters select all matching entries. A full job queue or exhausted temporary storage returns HTTP 429 with `Retry-After: 30`. Export retains its existing empty-selection behavior.
+
+### Additional regression checks
+
+The real HTTP integration tests require `aiohttp` (already used by ComfyUI). For a standalone development environment, install `Pillow` and `aiohttp`. Without aiohttp, the HTTP integration tests are explicitly skipped. The remaining tests use temporary libraries and do not require ComfyUI.
+
+```sh
+python -m unittest discover -s tests -v
+node --experimental-vm-modules --test tests/test_frontend.mjs
+node --input-type=module --check < web/lifecycle.js
+```
+See [CHANGELOG.md](CHANGELOG.md) for implemented changes.

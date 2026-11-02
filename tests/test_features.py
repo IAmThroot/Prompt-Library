@@ -1,9 +1,7 @@
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
-import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -252,24 +250,59 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertTrue(prompts[0]['has_thumb'])
 
-        # 2. Test v2 schema migration (including real ComfyUI database if available)
-        real_db = Path('/home/iamthroot/ComfyUI/user/prompt_library/library.db')
-        if real_db.exists():
-            v2_dir = self.base / 'real_v2_test'
-            v2_pl = v2_dir / 'prompt_library'
-            v2_pl.mkdir(parents=True)
-            shutil.copy(real_db, v2_pl / 'library.db')
-            real_thumbs = Path('/home/iamthroot/ComfyUI/user/prompt_library/thumbs')
-            if real_thumbs.exists():
-                shutil.copytree(real_thumbs, v2_pl / 'thumbs')
-            folders.get_user_directory = lambda: str(v2_dir)
-            db.init()
-            self.assertTrue((v2_pl / 'library.db.before-v3.bak').exists())
-            with db.db() as conn:
-                self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 3)
-                self.assertEqual(conn.execute('SELECT COUNT(*) FROM prompts WHERE deleted=1').fetchone()[0], 129)
-                self.assertGreater(conn.execute('SELECT COUNT(*) FROM assets').fetchone()[0], 0)
-                self.assertEqual(conn.execute('SELECT COUNT(*) FROM generations WHERE asset_id IS NULL').fetchone()[0], 0)
+        # 2. Upgrade a self-contained v2 database, independent of the installed ComfyUI library.
+        v2_dir = self.base / 'legacy_v2'
+        v2_pl = v2_dir / 'prompt_library'
+        v2_pl.mkdir(parents=True)
+        v2_file = v2_pl / 'library.db'
+        root = str(self.output)
+        with sqlite3.connect(v2_file) as conn:
+            conn.executescript(db.SCHEMA)
+            conn.execute('DROP TABLE files')
+            conn.execute('''CREATE TABLE files (
+                root TEXT NOT NULL, path TEXT NOT NULL, prompt_id INTEGER,
+                media_type TEXT NOT NULL, mtime REAL NOT NULL, size INTEGER NOT NULL,
+                missing INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT, extractor INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+                retry_at REAL NOT NULL DEFAULT 0, PRIMARY KEY(root,path))''')
+            conn.execute('''CREATE TABLE generations (
+                id INTEGER PRIMARY KEY, prompt_id INTEGER NOT NULL, root TEXT NOT NULL,
+                path TEXT NOT NULL, mtime REAL NOT NULL, size INTEGER NOT NULL,
+                extractor INTEGER NOT NULL, snapshot TEXT NOT NULL, created_at REAL NOT NULL,
+                UNIQUE(root,path,mtime,size,extractor))''')
+            conn.execute('CREATE TABLE prompt_details (prompt_id INTEGER PRIMARY KEY, details TEXT NOT NULL)')
+            conn.execute('''INSERT INTO prompts(hash,positive,title,notes,deleted,created_at,updated_at,last_seen)
+                VALUES (?,?,?,?,0,1,1,1)''',
+                (extract.prompt_hash('v2 prompt', ''), 'v2 prompt', 'V2 title', 'V2 notes'))
+            conn.execute('''INSERT INTO prompts(hash,positive,deleted,created_at,updated_at,last_seen)
+                VALUES (?,?,1,1,1,1)''', (extract.prompt_hash('v2 removed', ''), 'v2 removed'))
+            conn.execute('''INSERT INTO files(root,path,prompt_id,media_type,mtime,size,missing,status,extractor)
+                VALUES (?,?,?,?,?,?,0,'imported',2)''', (root, 'present.png', 1, 'image', 100, 200))
+            conn.execute('''INSERT INTO files(root,path,prompt_id,media_type,mtime,size,missing,status,extractor)
+                VALUES (?,?,?,?,?,?,1,'missing',2)''', (root, 'gone.png', 2, 'image', 100, 200))
+            conn.execute('''INSERT INTO generations(prompt_id,root,path,mtime,size,extractor,snapshot,created_at)
+                VALUES (?,?,?,?,?,?,?,?)''', (1, root, 'present.png', 100, 200, 2, '{}', 100))
+            conn.execute('PRAGMA user_version=2')
+        conn.close()
+        folders.get_user_directory = lambda: str(v2_dir)
+        db.init()
+        backup = v2_pl / 'library.db.before-v3.bak'
+        self.assertTrue(backup.exists())
+        with sqlite3.connect(backup) as conn:
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='assets'").fetchone()[0], 0)
+        conn.close()
+        with db.db() as conn:
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 3)
+            self.assertEqual(conn.execute('SELECT title FROM prompts WHERE id=1').fetchone()[0], 'V2 title')
+            self.assertEqual(conn.execute('SELECT notes FROM prompts WHERE id=1').fetchone()[0], 'V2 notes')
+            self.assertEqual(conn.execute('SELECT deleted FROM prompts WHERE id=2').fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT missing FROM files WHERE path='gone.png'").fetchone()[0], 1)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM assets').fetchone()[0], 1)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM generations WHERE asset_id IS NULL').fetchone()[0], 0)
+        db.init()
+        with db.db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM assets').fetchone()[0], 1)
 
     def test_collection_merging_case_insensitive(self):
         # Create an archive with collection 'nature' (lowercase)
@@ -479,39 +512,13 @@ class FeatureTests(unittest.TestCase):
             self.assertFalse(scanner.start_scan(background=True))
         scanner._pending = scanner._pending_force = False
 
-    def test_copied_output_folder_integration_validation(self):
-        real_output = Path(__file__).resolve().parents[1] / 'output'
-        if not real_output.is_dir():
-            self.skipTest('output directory not found')
-
-        # Run isolated audit against real output folder
-        folders.get_output_directory = lambda: str(real_output)
-        test_user = self.base / 'copied_output_test_user'
-        folders.get_user_directory = lambda: str(test_user)
-        db.init()
-
-        scanner._scan(True)
-        report = scanner.get_status()
-        self.assertEqual(report['counts']['discovered'], 397)
-        self.assertEqual(report['counts']['imported'], 198)
-        self.assertEqual(report['counts']['duplicate'], 148)
-        self.assertEqual(report['counts']['workflow_only'], 2)
-        self.assertEqual(db.list_prompts()['total'], 200)
-
-        # Roundtrip export and import in another isolated library
-        archive_path = self.base / 'copied_output_export.zip'
-        archives.export_archive(archive_path)
-        self.assertTrue(archive_path.exists())
-
-        target_user = self.base / 'copied_output_target_user'
-        folders.get_user_directory = lambda: str(target_user)
-        db.init()
-        archives.import_archive(archive_path)
-        self.assertEqual(db.list_prompts()['total'], 200)
-
-        # Repeated import
-        archives.import_archive(archive_path)
-        self.assertEqual(db.list_prompts()['total'], 200)
-
+    def test_package_version_and_metadata(self):
+        import importlib
+        init_spec = importlib.util.spec_from_file_location(f'{base.PACKAGE}.__init__', Path(__file__).resolve().parent.parent / '__init__.py')
+        init_mod = importlib.util.module_from_spec(init_spec)
+        init_mod.__package__ = base.PACKAGE
+        init_spec.loader.exec_module(init_mod)
+        self.assertEqual(init_mod.__version__, "1.1.0")
+        self.assertIn("__version__", init_mod.__all__)
 
 if __name__=='__main__':unittest.main()

@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { latestRequest, retainedResources, releaseMedia } from "./lifecycle.js";
 
 const API = "/prompt_library";
 const PAGE = 50;
@@ -41,9 +42,10 @@ function h(tag, props = {}, ...kids) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function call(path, { method = "GET", body } = {}) {
+async function call(path, { method = "GET", body, signal } = {}) {
   const res = await api.fetchApi(`${API}${path}`, {
     method,
+    signal,
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -96,7 +98,7 @@ function btn(label, fn, opts = {}) {
       title: opts.title,
       onClick: (e) => {
         e.stopPropagation();
-        Promise.resolve().then(() => fn(e)).catch((err) => notify(err.message || String(err), "error"));
+        Promise.resolve().then(() => fn(e)).catch((err) => { if (err.name !== "AbortError") notify(err.message || String(err), "error"); });
       },
     },
     label
@@ -211,7 +213,7 @@ function runScan({ force = false } = {}) {
 
 function reloadAll() {
   for (const p of [...panels]) {
-    if (!p.el.isConnected) panels.delete(p);
+    if (!p.el.isConnected) { p.dispose(); panels.delete(p); }
     else p.reload();
   }
 }
@@ -273,7 +275,7 @@ function openLibrary({ targetNode = null } = {}) {
     btn("Close", () => close(), { small: true })
   );
   panels.add(panel);
-  close = showOverlay([header, panel.el], { className: "pl-library", onClose: () => panels.delete(panel) });
+  close = showOverlay([header, panel.el], { className: "pl-library", onClose: () => { panel.dispose(); panels.delete(panel); } });
   panel.reload();
 }
 
@@ -329,6 +331,9 @@ function openEditor(p, onSaved) {
 /* ------------------------------------------------------------------ */
 
 function createPanel({ targetNode = null, onUse = null } = {}) {
+  const lifetime = new AbortController();
+  const listRequests = latestRequest(lifetime.signal);
+  const galleries = retainedResources();
   const selected = new Set();
   let collection = "";
   let selectionFilter = "";
@@ -360,7 +365,8 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
     selected.clear(); notify(`Updated ${result.count} entries`); reloadAll();
   }
   async function refreshCollections() {
-    collectionItems = (await call("/collections")).items;
+    collectionItems = (await call("/collections", { signal: lifetime.signal })).items;
+    if (lifetime.signal.aborted) return;
     if (collection && !collectionItems.some((item) => item.id === collection)) collection = "";
     collectionEl.replaceChildren(h("option", { value: "" }, "All collections"), ...collectionItems.map((item) => h("option", { value: item.id }, `${item.name} (${item.count})`)));
     collectionEl.value = collection;
@@ -422,15 +428,22 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
     const filterKey = JSON.stringify(filters());
     if (selectionFilter !== filterKey) { selected.clear(); selectionFilter = filterKey; }
     const mine = ++seq;
+    const request = listRequests.next();
     const qs = new URLSearchParams({ search: state.search, filter: state.filter, sort: state.sort, collection, offset, limit: PAGE });
     let data;
-    try { data = await call(`/list?${qs}`); } finally { if (mine === seq) loading = false; }
-    if (mine !== seq) return; // a newer request replaced this one
+    try { data = await call(`/list?${qs}`, { signal: request.signal }); } finally { request.finish(); if (mine === seq) loading = false; }
+    if (mine !== seq || !request.current()) return; // a newer request replaced this one
     state.items = offset ? state.items.concat(data.items) : data.items;
     state.total = data.total;
     render();
   }
-  const reload = () => { state.files = {}; return refreshCollections().then(() => load(0)).catch((e) => notify(e.message, "error")); };
+  const reload = () => {
+    if (lifetime.signal.aborted) return Promise.resolve();
+    listRequests.dispose();
+    state.files = {};
+    return refreshCollections().then(() => { if (!lifetime.signal.aborted) return load(0); })
+      .catch((e) => { if (e.name !== 'AbortError') notify(e.message, "error"); });
+  };
 
   async function doScan(force) {
     scanBtn.disabled = true;
@@ -445,6 +458,8 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
   }
 
   function render() {
+    if (lifetime.signal.aborted) return;
+    galleries.prune(state.items.filter((item) => state.open.has(item.id)).map((item) => item.id));
     renderSelection();
     chipsEl.replaceChildren(
       ...FILTERS.map(([value, label]) =>
@@ -531,8 +546,9 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
     };
     if (state.files[p.id]) return draw(state.files[p.id]);
     box.textContent = "Loading files...";
-    call(`/files/${p.id}`)
+    call(`/files/${p.id}`, { signal: lifetime.signal })
       .then((d) => {
+        if (lifetime.signal.aborted) return;
         state.files[p.id] = d.files;
         draw(d.files);
       })
@@ -632,7 +648,16 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
     let body = null;
     if (open) {
       const filesBox = h("div", { class: "pl-files" });
-      const workflowsBox = h("div", { class: "pl-files" });
+      const resources = galleries.get(p.id, () => {
+        const controller = new AbortController();
+        const workflowsBox = h("div", { class: "pl-files" });
+        const gallery = generationGallery(p.id);
+        workflowList(p.id, workflowsBox, controller.signal).catch((error) => {
+          if (error.name !== 'AbortError') workflowsBox.textContent = error.message;
+        });
+        return { workflowsBox, gallery, dispose() { controller.abort(); gallery.dispose(); } };
+      });
+      const workflowsBox = resources.workflowsBox;
       body = h(
         "div",
         { class: "pl-body" },
@@ -649,7 +674,7 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
         badges,
         filesBox,
         workflowsBox,
-        generationGallery(p.id),
+        resources.gallery,
         h(
           "div",
           { class: "pl-row" },
@@ -672,7 +697,6 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
         )
       );
       fileList(p, filesBox);
-      workflowList(p.id, workflowsBox).catch((error) => { workflowsBox.textContent = error.message; });
     }
     return h("div", { class: `pl-card${open ? " open" : ""}` }, head, body);
   }
@@ -680,6 +704,9 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
   return {
     el,
     reload,
+    dispose() {
+      lifetime.abort(); listRequests.dispose(); galleries.dispose(); clearTimeout(searchTimer);
+    },
     onScan(st) {
       state.scanText = st.running ? `Scanning ${st.done} of ${st.total} new or changed files...` : "";
       renderFoot();
@@ -743,6 +770,8 @@ function chooseImport() {
       close = showOverlay(h("div", { class: "pl-editor" }, h("strong", {}, "Import preview"),
         h("div", {}, `${report.new} new · ${report.duplicates} existing · ${report.conflicts.length} annotation conflicts`),
         h("div", { class: "pl-dim" }, "Local edits and removals are preserved. Missing information, tags, collections and distinct history are merged."),
+        report.conflicts_truncated ? h("div", {}, "Showing a shortened conflict preview. Download the full report for all details.") : null,
+        downloadLink(`/jobs/${data.job}/download`, "Download full preview report"),
         ...report.conflicts.map((conflict) => h("details", {}, h("summary", {}, `Conflict: ${conflict.field}`),
           h("div", { class: "pl-pre" }, `Local: ${conflict.local}\nImported: ${conflict.imported}`))),
         btn("Import archive", async () => {
@@ -804,24 +833,28 @@ function workflowActions(workflow) {
     workflow.has_api ? downloadLink(`/workflow/${workflow.id}/api?download=1`, "Download API graph") : null);
 }
 
-async function workflowList(pid, container) {
-  const { items } = await call(`/workflows/${pid}`);
+async function workflowList(pid, container, signal) {
+  const { items } = await call(`/workflows/${pid}`, { signal });
+  if (signal?.aborted) return;
   container.replaceChildren(...items.map((workflow, index) => h("div", {},
     h("span", { class: "pl-dim" }, `Workflow ${index + 1}${workflow.has_editor ? "" : " (API only)"}`), workflowActions(workflow))));
 }
 
 function generationGallery(pid) {
+  const controller = new AbortController();
   const container = h("div", { class: "pl-gallery" });
+  container.dispose = () => controller.abort();
   let offset = 0;
   let busy = false;
   const more = btn("Load more generations", load);
   const cards = h("div", { class: "pl-gallery-grid" });
   container.append(cards, more);
   async function load() {
-    if (busy) return;
+    if (busy || controller.signal.aborted) return;
     busy = true; more.disabled = true;
     try {
-      const { items, total } = await call(`/gallery/${pid}?offset=${offset}&limit=12`);
+      const { items, total } = await call(`/gallery/${pid}?offset=${offset}&limit=12`, { signal: controller.signal });
+      if (controller.signal.aborted) return;
       for (const generation of items) {
         const mediaBox = h("div", { class: "pl-generation-preview" });
         if (generation.has_preview) mediaBox.append(h("img", { loading: "lazy", alt: "Generation preview", src: api.apiURL(`${API}/preview/${generation.id}?v=${generation.preview_version}`) }));
@@ -832,7 +865,7 @@ function generationGallery(pid) {
           const media = h(tag, { class: "pl-player", src: api.apiURL(`${API}/media/${generation.id}`), controls: tag !== "img", preload: "metadata",
             onError: () => notify("This original is no longer available or its format cannot be played by this browser.", "warn") });
           close = showOverlay(h("div", { class: "pl-editor" }, media, btn("Close", () => close())),
-            { className: "pl-library", onClose: () => { media.pause?.(); media.removeAttribute("src"); media.load?.(); } });
+            { className: "pl-library", onClose: () => { releaseMedia(media); } });
         }) : h("span", { class: "pl-dim" }, "Original missing, changed, or not linked locally");
         const snapshot = generation.snapshot || {};
         cards.append(h("div", { class: "pl-generation" }, mediaBox,
@@ -848,7 +881,7 @@ function generationGallery(pid) {
       if (!total) cards.append(h("div", { class: "pl-dim" }, "No source generations are linked to this entry."));
     } finally { busy = false; more.disabled = false; }
   }
-  load().catch((error) => { cards.append(h("div", {}, error.message)); });
+  load().catch((error) => { if (error.name !== "AbortError") cards.append(h("div", {}, error.message)); });
   return container;
 }
 
@@ -857,13 +890,13 @@ async function showLibrarySettings() {
   const service = await call("/service");
   const fields = {};
   const labels = { capture_enabled: "Capture outputs while ComfyUI runs", scan_interval: "Scan interval (seconds)",
-    include_hidden: "Include hidden output folders", follow_symlinks: "Follow linked folders", backup_enabled: "Automatic backups",
+    include_hidden: "Include hidden output folders", follow_symlinks: "Follow linked files and folders", allowed_external_roots: "Allowed external folders (one absolute path per line)", backup_enabled: "Automatic backups",
     backup_interval_hours: "Backup interval (hours)", backup_keep: "Scheduled backups to keep", archive_max_mb: "Maximum archive upload (MB)",
     archive_expanded_max_mb: "Maximum expanded archive (MB)" };
   const form = Object.entries(labels).map(([key, label]) => {
     const boolean = typeof settings[key] === "boolean";
-    const input = h("input", { class: boolean ? "" : "pl-input", type: boolean ? "checkbox" : "number" });
-    if (boolean) input.checked = settings[key]; else input.value = settings[key];
+    const input = h(key === "allowed_external_roots" ? "textarea" : "input", { class: boolean ? "" : "pl-input", type: boolean ? "checkbox" : "number" });
+    if (boolean) input.checked = settings[key]; else input.value = key === "allowed_external_roots" ? (settings[key] || []).join("\n") : settings[key];
     fields[key] = input;
     return h("label", { class: "pl-row" }, input, h("span", {}, label));
   });
@@ -873,7 +906,7 @@ async function showLibrarySettings() {
     h("div", { class: "pl-dim" }, `Capture service: ${service.running ? "running" : "stopped"} · Next scan: ${date(service.next_scan)} · Next backup: ${date(service.next_backup)}`),
     service.last_error ? h("div", { class: "pl-notes" }, service.last_error) : null,
     btn("Save settings", async () => {
-      const body = Object.fromEntries(Object.keys(labels).map((key) => [key, typeof settings[key] === "boolean" ? fields[key].checked : Number(fields[key].value)]));
+      const body = Object.fromEntries(Object.keys(labels).map((key) => [key, key === "allowed_external_roots" ? fields[key].value.split("\n").map((v) => v.trim()).filter(Boolean) : typeof settings[key] === "boolean" ? fields[key].checked : Number(fields[key].value)]));
       await call("/settings", { method: "POST", body }); notify("Library settings saved"); close();
     }, { primary: true }),
     btn("Back up now", async () => { const { job } = await call("/backups", { method: "POST", body: {} }); await awaitJob(job, "Create backup"); close(); await showLibrarySettings(); }),
@@ -1016,7 +1049,7 @@ app.registerExtension({
     let polling = false;
     let lastFinished = null;
     setInterval(async () => {
-      for (const panel of [...panels]) if (!panel.el.isConnected) panels.delete(panel);
+      for (const panel of [...panels]) if (!panel.el.isConnected) { panel.dispose(); panels.delete(panel); }
       if (!panels.size || polling) return;
       polling = true;
       try {

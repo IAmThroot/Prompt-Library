@@ -8,7 +8,7 @@ import uuid
 from . import db
 
 DEFAULTS = {'capture_enabled': True, 'scan_interval': 30, 'include_hidden': False,
-            'follow_symlinks': False, 'backup_enabled': True, 'backup_interval_hours': 24,
+            'follow_symlinks': False, 'allowed_external_roots': [], 'backup_enabled': True, 'backup_interval_hours': 24,
             'backup_keep': 7, 'archive_max_mb': 512, 'archive_expanded_max_mb': 2048}
 
 
@@ -64,7 +64,7 @@ def migrate(conn):
 
 def settings():
     with db.db() as conn:
-        return {r['key']: json.loads(r['value']) for r in conn.execute('SELECT * FROM preferences') if r['key'] in DEFAULTS}
+        return {**DEFAULTS, **{r['key']: json.loads(r['value']) for r in conn.execute('SELECT * FROM preferences') if r['key'] in DEFAULTS}}
 
 
 def update_settings(values):
@@ -74,7 +74,13 @@ def update_settings(values):
     for key, value in values.items():
         if key not in DEFAULTS:
             raise ValueError('Unknown setting: ' + key)
-        if isinstance(DEFAULTS[key], bool):
+        if key == 'allowed_external_roots':
+            if not isinstance(value, list) or not all(isinstance(v, str) and os.path.isabs(v) for v in value):
+                raise ValueError('Allowed folders must be a list of absolute directory paths')
+            value = list(dict.fromkeys(os.path.realpath(v) for v in value))
+            if any(not os.path.isdir(v) for v in value):
+                raise ValueError('Allowed folders must exist and be directories')
+        elif isinstance(DEFAULTS[key], bool):
             if not isinstance(value, bool):
                 raise ValueError(key + ' must be a boolean')
         elif type(value) is not int or not limits[key][0] <= value <= limits[key][1]:
@@ -87,21 +93,8 @@ def update_settings(values):
 
 
 def metadata_workflows(metadata):
-    def parsed(value):
-        if isinstance(value, str):
-            try:
-                return json.loads(value)
-            except (ValueError, TypeError):
-                return None
-        return value
-    editor, api = parsed(metadata.get('workflow')), parsed(metadata.get('prompt'))
-    for key in ('comment', 'description', 'usercomment'):
-        value = parsed(metadata.get(key))
-        if isinstance(value, dict):
-            editor = editor or parsed(value.get('workflow'))
-            api = api or parsed(value.get('prompt'))
-    editor = editor if isinstance(editor, dict) and isinstance(editor.get('nodes'), list) else None
-    api = api if isinstance(api, dict) and any(isinstance(v, dict) and 'class_type' in v for v in api.values()) else None
+    from .extract import discover_workflows
+    editor, api = discover_workflows(metadata)
     # Some custom nodes serialize NaN cache markers. JSON round-tripping must remain portable.
     def sanitize(value):
         import math
@@ -195,6 +188,29 @@ def asset(conn, root, path, mtime, size, media_type, trusted=False):
     return aid
 
 
+def permitted_path(root, path, preferences):
+    """Resolve links against explicit local permissions, including file links."""
+    root, path = os.path.abspath(root), os.path.abspath(path)
+    try:
+        if os.path.commonpath([root, path]) != root:
+            return False
+        resolved = os.path.realpath(path)
+        if not preferences['follow_symlinks']:
+            # Checking components also catches links that resolve inside the output root.
+            relative = os.path.relpath(path, root)
+            current = root
+            for part in relative.split(os.sep):
+                current = os.path.join(current, part)
+                if os.path.islink(current):
+                    return False
+        roots = [os.path.realpath(root)]
+        if preferences['follow_symlinks']:
+            roots += preferences.get('allowed_external_roots', [])
+        return any(os.path.commonpath([resolved, allowed]) == allowed for allowed in roots)
+    except (OSError, ValueError):
+        return False
+
+
 def asset_path(aid, verify=True):
     with db.db() as conn:
         row = conn.execute('SELECT * FROM assets WHERE id=?', (aid,)).fetchone()
@@ -203,6 +219,8 @@ def asset_path(aid, verify=True):
     path = os.path.abspath(os.path.join(row['root'], row['path']))
     # Historical foreign paths are never trusted merely because an archive contains them.
     if os.path.commonpath([path, os.path.abspath(row['root'])]) != os.path.abspath(row['root']):
+        return None
+    if not permitted_path(row['root'], path, settings()):
         return None
     try:
         stat = os.stat(path)
@@ -274,6 +292,20 @@ def collection_delete(cid):
         conn.execute('DELETE FROM collections WHERE id=?', (cid,))
 
 
+def validate_selection(selection):
+    if not isinstance(selection, dict) or set(selection) not in ({'ids'}, {'filters'}):
+        raise ValueError('Provide exactly one explicit selection: ids or filters')
+    if 'ids' in selection:
+        if not isinstance(selection['ids'], list) or any(type(i) is not int or i <= 0 for i in selection['ids']):
+            raise ValueError('Selection ids must be positive integers')
+    else:
+        filters = selection['filters']
+        if not isinstance(filters, dict) or set(filters) - {'search', 'flt', 'collection'}:
+            raise ValueError('Invalid selection filters')
+        if any(not isinstance(v, str) and not (k == 'collection' and v is None) for k, v in filters.items()):
+            raise ValueError('Invalid selection filter value')
+
+
 def selected_ids(selection):
     if 'ids' in selection:
         ids = list(dict.fromkeys(int(i) for i in selection['ids']))
@@ -285,6 +317,9 @@ def selected_ids(selection):
 
 
 def bulk(selection, action, value=None):
+    if action not in ('collection_add', 'collection_remove', 'tag_add', 'tag_remove', 'favorite', 'remove'):
+        raise ValueError('Unknown bulk action')
+    validate_selection(selection)
     ids = selected_ids(selection)
     with db.db() as conn:
         if action in ('collection_add', 'collection_remove') and not conn.execute('SELECT 1 FROM collections WHERE id=?', (value,)).fetchone():

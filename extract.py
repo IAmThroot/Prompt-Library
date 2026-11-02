@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 
-EXTRACTOR_VERSION = 3
+EXTRACTOR_VERSION = 4
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}
 AUDIO_EXT = {".flac", ".mp3", ".wav", ".ogg", ".opus", ".m4a"}
@@ -107,17 +107,19 @@ def _read_image(path):
 def _read_av(path):
     try:
         import av
-    except ImportError:
-        return _probe(path)[0]
-
-    out = {}
-    with av.open(path) as container:
-        for key, val in (container.metadata or {}).items():
-            out[str(key).lower()] = val
-        for stream in container.streams:
-            for key, val in (stream.metadata or {}).items():
-                out.setdefault(str(key).lower(), val)
-    return out
+        out = {}
+        with av.open(path) as container:
+            for key, val in (container.metadata or {}).items():
+                out[str(key).lower()] = val
+            for stream in container.streams:
+                for key, val in (stream.metadata or {}).items():
+                    out.setdefault(str(key).lower(), val)
+        return out
+    except Exception as first:
+        try:
+            return _probe(path)[0]
+        except Exception as second:
+            raise RuntimeError(f'PyAV: {first}; ffprobe: {second}') from second
 
 
 # --------------------------------------------------------------------------- #
@@ -173,6 +175,22 @@ def _plain_result(positive, negative="", source="metadata"):
             "provenance": {"source": source}, "warnings": [], "stages": []}
 
 
+def discover_workflows(metadata):
+    metadata = {str(k).lower(): v for k, v in metadata.items()}
+    def parsed(value):
+        return _loads(value) if isinstance(value, str) else value
+    editor, api = parsed(metadata.get('workflow')), parsed(metadata.get('prompt'))
+    for key in ('comment', 'description', 'usercomment'):
+        value = parsed(metadata.get(key))
+        if isinstance(value, dict):
+            value = {str(k).lower(): v for k, v in value.items()} if not _is_graph(value) else value
+            editor = editor or parsed(value.get('workflow'))
+            candidate = parsed(value.get('prompt'))
+            api = api or (candidate if _is_graph(candidate) else value if _is_graph(value) else None)
+    return (editor if isinstance(editor, dict) and isinstance(editor.get('nodes'), list) else None,
+            api if _is_graph(api) else None)
+
+
 def extract_from_metadata(meta, output_hint=None):
     meta = {str(k).lower(): v for k, v in meta.items()}
     # Final assembled scene metadata is more specific than the editor's API graph.
@@ -183,7 +201,7 @@ def extract_from_metadata(meta, output_hint=None):
             result["extra"] = [{"role": "positive", "text": t, "label": f"Scene {i}"}
                                for i, t in enumerate(scenes[1:], 2)]
             return result
-    graph = _loads(meta.get("prompt"))
+    workflow, graph = discover_workflows(meta)
     if _is_graph(graph):
         result = extract_prompts(graph, output_hint)
         if result:
@@ -203,7 +221,6 @@ def extract_from_metadata(meta, output_hint=None):
             result = _plain_result(inner, _text(data.get("negative_prompt")), key)
             if result:
                 return result
-    workflow = _loads(meta.get("workflow"))
     if isinstance(workflow, dict):
         converted = workflow_graph(workflow)
         if converted:

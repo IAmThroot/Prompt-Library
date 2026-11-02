@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name for release (e.g. v1.0.0)'
+        description: 'Tag name for release (e.g. v1.1.0)'
         required: false
         default: ''
 
@@ -37,20 +37,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install Pillow
+          pip install Pillow aiohttp
 
       - name: Run Python unit tests
         run: python -m unittest discover -s tests -v
 
       - name: Verify compilation and syntax
         run: |
-          python -m compileall -q __init__.py nodes.py db.py extract.py routes.py scanner.py service.py archives.py library.py
+          python -m compileall -q __init__.py nodes.py db.py extract.py routes.py scanner.py service.py archives.py library.py validation.py
           node --input-type=module --check < web/prompt_library.js
+          node --input-type=module --check < web/lifecycle.js
+          node --experimental-vm-modules --test tests/test_frontend.mjs
 
       - name: Package custom node archive
         run: |
           mkdir -p build/prompt_library
-          cp -r __init__.py nodes.py db.py extract.py routes.py scanner.py service.py archives.py library.py README.md web build/prompt_library/
+          cp -r __init__.py nodes.py db.py extract.py routes.py scanner.py service.py archives.py library.py validation.py README.md CHANGELOG.md web build/prompt_library/
           cd build
           zip -r ../prompt_library.zip prompt_library -x "*.pyc" "*/__pycache__/*"
           cd ..

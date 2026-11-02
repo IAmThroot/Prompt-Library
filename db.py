@@ -10,6 +10,8 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager, closing
+from collections import OrderedDict
+from . import validation
 
 import folder_paths
 
@@ -156,6 +158,7 @@ def upsert_prompt(conn, data, explicit, seen_ts=None, title="", tags="", notes="
                 sets["notes"] = "\n\n".join(x for x in (row["notes"], notes) if x)
         conn.execute(f"UPDATE prompts SET {','.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), row["id"]))
         if any(data.get(k) for k in ("warnings", "provenance", "stages")):
+            conn.execute("UPDATE prompts SET meta=? WHERE id=?", (json.dumps(data.get("meta") or {}), row["id"]))
             conn.execute("INSERT OR REPLACE INTO prompt_details VALUES (?,?)",
                          (row["id"], json.dumps({k: data.get(k) for k in ("warnings", "provenance", "stages")})))
         return row["id"], created
@@ -191,8 +194,8 @@ def update_prompt(pid, fields):
             if not (pos or neg):
                 raise ValueError("A prompt needs a positive or a negative text.")
             if pos != row["positive"] or neg != row["negative"]:
-                imported = conn.execute("SELECT 1 FROM files WHERE prompt_id=? UNION SELECT 1 FROM generations WHERE prompt_id=?",
-                                        (pid, pid)).fetchone()
+                imported = conn.execute("SELECT 1 FROM files WHERE prompt_id=? UNION SELECT 1 FROM generations WHERE prompt_id=? UNION SELECT 1 FROM prompt_workflows WHERE prompt_id=?",
+                                        (pid, pid, pid)).fetchone()
                 if imported or row["origin"] == "scan":
                     # Editing imported text makes a personal copy; provenance stays immutable.
                     copied = {"positive": pos, "negative": neg}
@@ -292,16 +295,44 @@ def thumb_path(pid):
     return os.path.join(data_dir(), "thumbs", f"{int(pid)}.jpg")
 
 
+_thumb_cache = OrderedDict()
+_thumb_lock = threading.Lock()
+
+
+def invalidate_thumbs(path=None):
+    with _thumb_lock:
+        if path is None:
+            _thumb_cache.clear()
+        else:
+            _thumb_cache.pop(str(path), None)
+
+
 def valid_thumb(path):
-    """Check the cached image, including truncated/empty files from interrupted writes."""
+    path = str(path)
     try:
+        st = os.stat(path)
+        fingerprint = (st.st_size, st.st_mtime_ns)
+        with _thumb_lock:
+            cached = _thumb_cache.get(path)
+            if cached and cached[0] == fingerprint:
+                _thumb_cache.move_to_end(path)
+                return cached[1]
         from PIL import Image
-        with Image.open(path) as image:
-            if image.format != "JPEG":
-                return False
-            image.load()
-        return True
-    except Exception:
+        try:
+            with Image.open(path) as image:
+                valid = image.format == 'JPEG'
+                if valid:
+                    image.load()
+        except Exception:
+            valid = False
+        with _thumb_lock:
+            _thumb_cache[path] = (fingerprint, valid)
+            _thumb_cache.move_to_end(path)
+            while len(_thumb_cache) > 4096:
+                _thumb_cache.popitem(last=False)
+        return valid
+    except OSError:
+        invalidate_thumbs(path)
         return False
 
 
@@ -358,6 +389,7 @@ def ensure_thumb(pid, src, mtype="image", destination=None):
             image.convert("RGB").save(temporary, "JPEG", quality=80)
             # Only publish complete images, so concurrent requests cannot see a partial JPEG.
             os.replace(temporary, dst)
+            invalidate_thumbs(dst)
         finally:
             image.close()
         return None
@@ -387,7 +419,11 @@ def _row(r):
         d["thumb_version"] = str(os.stat(path).st_mtime_ns) if d["has_thumb"] else "0"
     except OSError:
         d["has_thumb"], d["thumb_version"] = False, "0"
-    d.update(json.loads(d.pop("details", None) or "{}"))
+    d.update(validation.safe_details(json.loads(d.pop("details", None) or "{}")))
+    snapshot = json.loads(d.pop('representative', None) or '{}')
+    if snapshot:
+        d['meta'] = snapshot.get('meta') or {}
+        d.update(validation.safe_details({k: snapshot.get(k) for k in ('warnings', 'provenance', 'stages')}))
     d.pop("hash", None)
     return d
 
@@ -425,6 +461,7 @@ def list_prompts(search="", flt="all", sort="latest", offset=0, limit=50, collec
         rows = conn.execute(
             f"""SELECT p.*,
                    (SELECT details FROM prompt_details WHERE prompt_id=p.id) AS details,
+                   (SELECT snapshot FROM generations WHERE prompt_id=p.id ORDER BY mtime DESC,id DESC LIMIT 1) AS representative,
                    (SELECT COUNT(*) FROM files f WHERE f.prompt_id=p.id) AS file_count,
                    (SELECT COUNT(*) FROM files f WHERE f.prompt_id=p.id AND f.missing=0) AS available_count,
                    (SELECT group_concat(DISTINCT f.media_type) FROM files f WHERE f.prompt_id=p.id) AS media

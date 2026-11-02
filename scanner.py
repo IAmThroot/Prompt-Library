@@ -2,6 +2,7 @@
 import os
 import threading
 import time
+from collections import OrderedDict
 
 import folder_paths
 
@@ -14,6 +15,7 @@ _options = {"include_hidden": False, "follow_symlinks": False}
 _retry_timer = None
 _worker = None
 _stopping = False
+_preview_failures = OrderedDict()
 status = {"running": False, "done": 0, "total": 0, "added": 0, "error": None,
           "finished": None, "queued": False, "counts": {}, "issues": []}
 
@@ -78,7 +80,13 @@ def _scan(force, include_hidden=False, follow_symlinks=False):
     root = os.path.realpath(folder_paths.get_output_directory())
     if not os.path.isdir(root):
         raise RuntimeError(f"Output folder not found: {root}")
+    preferences = library.settings()
+    preferences.update(include_hidden=include_hidden, follow_symlinks=follow_symlinks)
     known = db.known_files(root)
+    asset_rows = {}
+    with db.db() as conn:
+        for row in conn.execute('SELECT id,path,mtime,size FROM assets WHERE root=? AND trusted=1', (root,)):
+            asset_rows.setdefault(row['path'], []).append(dict(row))
     seen, todo, issues, counts = [], [], [], {}
     deferred = []
     inaccessible = []
@@ -90,18 +98,34 @@ def _scan(force, include_hidden=False, follow_symlinks=False):
         # Full per-file diagnostics are persisted in SQLite; bound status response size.
         if len(issues) < 200:
             issues.append({"path": path, "reason": reason})
-    def preview(pid, full, rel, mtype):
-        if pid and mtype in ("image", "video"):
-            diagnostic = db.ensure_thumb(pid, full, mtype)
+    def preview(pid, full, rel, mtype, refresh=False):
+        if not pid or mtype not in ('image', 'video'):
+            return
+        stat = os.stat(full)
+        key = (root, rel, stat.st_mtime_ns, stat.st_size)
+        failed = _preview_failures.get(key)
+        if failed and not force and failed['retry_at'] > time.time():
+            count('thumbnail_retry_wait')
+            return
+        diagnostic = db.ensure_thumb(pid, full, mtype)
+        if refresh:
             with db.db() as conn:
-                rows = conn.execute("SELECT DISTINCT asset_id FROM generations WHERE prompt_id=? AND root=? AND path=?", (pid, root, rel)).fetchall()
-            for row in rows:
-                if row['asset_id'] and library.asset_path(row['asset_id']):
-                    asset_error = db.ensure_thumb(pid, full, mtype, library.asset_thumb(row['asset_id']))
-                    diagnostic = diagnostic or asset_error
-            if diagnostic:
-                count("thumbnail_failed")
-                issue(rel, diagnostic)
+                asset_rows[rel] = [dict(row) for row in conn.execute(
+                    'SELECT id,path,mtime,size FROM assets WHERE root=? AND path=? AND trusted=1', (root, rel))]
+        for row in asset_rows.get(rel, []):
+            if (row['mtime'], row['size']) == (stat.st_mtime, stat.st_size):
+                asset_error = db.ensure_thumb(pid, full, mtype, library.asset_thumb(row['id']))
+                diagnostic = diagnostic or asset_error
+        if diagnostic:
+            attempts = (failed['attempts'] if failed else 0) + 1
+            _preview_failures[key] = {'attempts': attempts, 'retry_at': time.time() + min(3600, 5 * 2**min(attempts-1, 10))}
+            _preview_failures.move_to_end(key)
+            while len(_preview_failures) > 4096:
+                _preview_failures.popitem(last=False)
+            count('thumbnail_failed')
+            issue(rel, diagnostic)
+        else:
+            _preview_failures.pop(key, None)
     def walk_error(error):
         inaccessible.append(str(error))
         issue(str(error.filename), str(error))
@@ -127,7 +151,7 @@ def _scan(force, include_hidden=False, follow_symlinks=False):
             if name == "__pycache__" or (name.startswith(".") and not include_hidden):
                 count("excluded_folders")
                 excluded_prefixes.append(os.path.relpath(path, root).replace(os.sep, "/") + "/")
-            elif os.path.islink(path) and not follow_symlinks:
+            elif not library.permitted_path(root, path, preferences):
                 count("excluded_symlinks")
                 excluded_prefixes.append(os.path.relpath(path, root).replace(os.sep, "/") + "/")
             else:
@@ -142,6 +166,9 @@ def _scan(force, include_hidden=False, follow_symlinks=False):
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root).replace(os.sep, "/")
             seen.append(rel)
+            if not library.permitted_path(root, full, preferences):
+                count('excluded_symlinks')
+                continue
             old = known.get(rel)
             try:
                 st = os.stat(full)
@@ -217,7 +244,7 @@ def _scan(force, include_hidden=False, follow_symlinks=False):
             diagnostic = error or ("Metadata present but no supported prompt was resolved" if state == "unsupported_metadata" else
                                    "No generation metadata found" if state == "no_metadata" else None)
             db.record_file(conn, rel, pid, mtype, mtime, size, root, state=state, error=diagnostic, result=result, workflow_id=wid)
-        preview(pid, full, rel, mtype)
+        preview(pid, full, rel, mtype, refresh=True)
         count(state)
         if diagnostic:
             issue(rel, diagnostic)
