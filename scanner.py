@@ -99,6 +99,12 @@ def _scan(force, include_hidden=False, follow_symlinks=False):
         if len(issues) < 200:
             issues.append({"path": path, "reason": reason})
     def preview(pid, full, rel, mtype, refresh=False):
+        try:
+            _preview(pid, full, rel, mtype, refresh)
+        except OSError as exc:
+            count('thumbnail_failed')
+            issue(rel, f'Thumbnail unavailable: {exc}')
+    def _preview(pid, full, rel, mtype, refresh=False):
         if not pid or mtype not in ('image', 'video'):
             return
         stat = os.stat(full)
@@ -158,6 +164,9 @@ def _scan(force, include_hidden=False, follow_symlinks=False):
                 kept.append(name)
         dirnames[:] = kept
         for name in filenames:
+            if name.startswith('.') and not include_hidden:
+                count('excluded_files')
+                continue
             mtype = extract.media_type(name)
             if not mtype:
                 count("unsupported")

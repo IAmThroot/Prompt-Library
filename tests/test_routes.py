@@ -50,6 +50,14 @@ class Request:
 
 
 class RouteTests(unittest.TestCase):
+    def test_selection_requires_explicit_valid_input(self):
+        pid, _ = base.db.save_prompt({'positive': 'selection example'})
+        for body in ({}, {'ids': 'bad'}, {'ids': [pid], 'filters': {}}, {'filters': {'unknown': 'x'}}):
+            self.assertEqual(self.run_async(routes.selection(Request(body))).status, 400)
+        result = self.run_async(routes.selection(Request({'ids': [pid]})))
+        self.assertEqual(result.data['ids'], [pid])
+        result = self.run_async(routes.selection(Request({'filters': {}})))
+        self.assertEqual(result.data['ids'], [pid])
     setUp=base.StorageTests.setUp
     def tearDown(self):
         service.stop();base.scanner._stopping=False

@@ -22,6 +22,34 @@ from test_library import graph, folders
 
 
 class RemediationTests(unittest.TestCase):
+    file = base.FeatureTests.file
+    def test_hidden_filenames_follow_capture_setting(self):
+        self.file('.hidden.png')
+        self.file('visible.png')
+        scanner._scan(False)
+        self.assertNotIn('.hidden.png', db.known_files())
+        self.assertIn('visible.png', db.known_files())
+        scanner._scan(False, include_hidden=True)
+        self.assertIn('.hidden.png', db.known_files())
+
+    def test_disappearing_preview_source_does_not_abort_scan(self):
+        source = self.file('first.png')
+        self.file('second.png')
+        original = os.stat
+        calls = 0
+        def disappearing(path, *args, **kwargs):
+            nonlocal calls
+            if str(path) == str(source):
+                calls += 1
+                if calls >= 3:  # Discovery and metadata checks succeed; preview loses the file.
+                    raise FileNotFoundError('Source moved')
+            return original(path, *args, **kwargs)
+        with patch.object(scanner.os, 'stat', side_effect=disappearing), \
+                patch.object(extract, 'read_media', return_value=({'prompt': graph()}, 'image', None)):
+            scanner._scan(False)
+        self.assertIn('second.png', db.known_files())
+        self.assertGreater(scanner.get_status()['counts'].get('thumbnail_failed', 0), 0)
+
     setUp = base.FeatureTests.setUp
 
     def tearDown(self):

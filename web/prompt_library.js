@@ -433,6 +433,7 @@ function createPanel({ targetNode = null, onUse = null } = {}) {
     let data;
     try { data = await call(`/list?${qs}`, { signal: request.signal }); } finally { request.finish(); if (mine === seq) loading = false; }
     if (mine !== seq || !request.current()) return; // a newer request replaced this one
+    if (!offset) galleries.dispose(); // Data refreshes must also refresh generations and workflows.
     state.items = offset ? state.items.concat(data.items) : data.items;
     state.total = data.total;
     render();
@@ -734,24 +735,32 @@ function downloadLink(path, label) {
 }
 
 async function awaitJob(id, label) {
+  const controller = new AbortController();
   const status = h("div", { class: "pl-pre", role: "status", "aria-live": "polite" }, "Queued…");
   let close;
   close = showOverlay(h("div", { class: "pl-editor" }, h("strong", {}, label), status,
-    h("div", { class: "pl-dim" }, "This job continues if you close this window."), btn("Close", () => close())), { className: "pl-narrow" });
+    h("div", { class: "pl-dim" }, "This job continues if you close this window. Check Recent jobs in Settings and backups for its status."), btn("Close", () => close())),
+    { className: "pl-narrow", onClose: () => controller.abort() });
   try {
-    while (true) {
-      const job = await call(`/jobs/${id}`);
+    while (!controller.signal.aborted) {
+      const job = await call(`/jobs/${id}`, { signal: controller.signal });
+      if (controller.signal.aborted) return null;
       status.textContent = job.state === "running" ? "Working…" : job.state;
       if (job.state === "failed") throw new Error(job.error || "Job failed");
       if (job.state === "complete") { close(); return job.result; }
       await sleep(500);
     }
-  } catch (error) { status.textContent = error.message; throw error; }
+    return null;
+  } catch (error) {
+    if (controller.signal.aborted) return null;
+    status.textContent = error.message; throw error;
+  }
 }
 
 async function exportSelection(selection) {
   const { job } = await call("/export", { method: "POST", body: selection });
   const result = await awaitJob(job, "Export library");
+  if (!result) return;
   let close;
   close = showOverlay(h("div", { class: "pl-editor" }, h("strong", {}, `${result.count} entries exported`),
     downloadLink(`/jobs/${job}/download`, "Download archive"), btn("Close", () => close())), { className: "pl-narrow" });
@@ -766,6 +775,7 @@ function chooseImport() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Upload failed");
       const report = await awaitJob(data.job, "Check archive");
+      if (!report) return;
       let close;
       close = showOverlay(h("div", { class: "pl-editor" }, h("strong", {}, "Import preview"),
         h("div", {}, `${report.new} new · ${report.duplicates} existing · ${report.conflicts.length} annotation conflicts`),
@@ -777,7 +787,8 @@ function chooseImport() {
         btn("Import archive", async () => {
           close();
           const result = await call("/import/commit", { method: "POST", body: { preview_job: data.job } });
-          await awaitJob(result.job, "Import library"); reloadAll();
+          if (!await awaitJob(result.job, "Import library")) return;
+          reloadAll();
           let finish;
           finish = showOverlay(h("div", { class: "pl-editor" }, h("strong", {}, "Import complete"),
             downloadLink(`/jobs/${result.job}/download`, "Download import report"), btn("Close", () => finish())), { className: "pl-narrow" });
@@ -909,13 +920,14 @@ async function showLibrarySettings() {
       const body = Object.fromEntries(Object.keys(labels).map((key) => [key, key === "allowed_external_roots" ? fields[key].value.split("\n").map((v) => v.trim()).filter(Boolean) : typeof settings[key] === "boolean" ? fields[key].checked : Number(fields[key].value)]));
       await call("/settings", { method: "POST", body }); notify("Library settings saved"); close();
     }, { primary: true }),
-    btn("Back up now", async () => { const { job } = await call("/backups", { method: "POST", body: {} }); await awaitJob(job, "Create backup"); close(); await showLibrarySettings(); }),
+    btn("Back up now", async () => { const { job } = await call("/backups", { method: "POST", body: {} }); if (!await awaitJob(job, "Create backup")) return; close(); await showLibrarySettings(); }),
     h("strong", {}, "Backups"),
     ...service.backups.map((backup) => h("div", { class: "pl-row" }, h("span", {}, `${date(backup.created_at)} (${backup.scheduled ? "scheduled" : "manual / safety"})`),
       downloadLink(`/backups/${backup.id}/download`, "Download"), btn("Restore", async () => {
         if (!confirm("Replace the library with this backup? A safety backup of the current library will be created first. Output files are not changed.")) return;
         const { job } = await call(`/backups/${backup.id}/restore`, { method: "POST", body: { confirm: true } });
-        await awaitJob(job, "Restore library"); reloadAll(); close(); notify("Library restored; safety backup retained");
+        if (!await awaitJob(job, "Restore library")) return;
+        reloadAll(); close(); notify("Library restored; safety backup retained");
       }))),
     h("strong", {}, "Recent jobs"),
     ...(service.jobs || []).map((job) => h("div", { class: "pl-dim" }, `${job.kind}: ${job.state}${job.error ? " — " + job.error : ""}`)),

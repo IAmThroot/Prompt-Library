@@ -57,7 +57,7 @@ async function panelHarness(fetchApi) {
   const app = { registerExtension() {} };
   const api = { fetchApi, apiURL: (path) => path };
   const source = await readFile(new URL('../web/prompt_library.js', import.meta.url), 'utf8');
-  const module = new vm.SourceTextModule(source + '\nexport { createPanel, generationGallery };', { context });
+  const module = new vm.SourceTextModule(source + '\nexport { createPanel, generationGallery, awaitJob }; export const testDocument = document;', { context });
   await module.link(async (specifier) => {
     if (specifier === './lifecycle.js') return new vm.SourceTextModule(lifecycleSource, { context });
     const key = specifier.includes('app.js') ? 'app' : 'api';
@@ -90,7 +90,26 @@ test('actual panel preserves gallery pages through selection rerenders', async (
   await flush();
   assert.equal(find(panel.el, (x) => x.className === 'pl-gallery'), gallery);
   assert.equal(galleryCalls, 2);
+  await panel.reload();
+  await flush();
+  assert.notEqual(find(panel.el, (x) => x.className === 'pl-gallery'), gallery);
+  assert.equal(galleryCalls, 3);
   panel.dispose();
+});
+
+test('closing job progress aborts observation and returns no completion result', async () => {
+  let signal;
+  let calls = 0;
+  const module = await panelHarness((path, options) => {
+    calls++;
+    signal = options.signal;
+    return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(Object.assign(Error('aborted'), { name: 'AbortError' }))));
+  });
+  const pending = module.awaitJob('example', 'Export library');
+  find(module.testDocument.body, (x) => x.tag === 'button' && text(x) === 'Close').click();
+  assert.equal(await pending, null);
+  assert.equal(signal.aborted, true);
+  assert.equal(calls, 1);
 });
 
 test('actual gallery disposal aborts pending fetch', async () => {

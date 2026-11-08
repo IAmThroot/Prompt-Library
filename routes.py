@@ -168,7 +168,9 @@ async def collection_delete(request):
 @routes.post('/prompt_library/selection')
 @guarded
 async def selection(request):
-    ids = await asyncio.to_thread(library.selected_ids,await _body(request))
+    body = await _body(request)
+    library.validate_selection(body)
+    ids = await asyncio.to_thread(library.selected_ids, body)
     return web.json_response({'ids':ids,'count':len(ids)})
 
 
