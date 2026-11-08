@@ -21,6 +21,8 @@ Prompt Library is an extension and custom node for [ComfyUI](https://github.com/
 
 ## Install Guide
 
+**Updates are published to this repository's `main` branch. The Releases page and its ZIP downloads will not receive further updates.** Git clone is recommended so you can keep your installation current with `git pull`. If you install an older release ZIP, follow the one-time setup below before updating.
+
 ### Option 1: Git Clone (Recommended)
 
 1. Navigate to your ComfyUI `custom_nodes` directory:
@@ -36,7 +38,7 @@ Prompt Library is an extension and custom node for [ComfyUI](https://github.com/
 ### Option 2: Download Release ZIP
 
 1. Go to the [Releases](https://github.com/IAmThroot/Prompt-Library/releases) page.
-2. Download `prompt_library.zip` from the latest release (v1.1).
+2. Download an available `prompt_library.zip`. These archives are older snapshots and do not include subsequent fixes.
 3. Extract the ZIP into your ComfyUI `custom_nodes/` directory so the folder structure is:
    ```text
    ComfyUI/
@@ -50,7 +52,33 @@ Prompt Library is an extension and custom node for [ComfyUI](https://github.com/
    ```
 4. Restart ComfyUI.
 
+### Updating an Existing Installation
+
+For a Git installation, stop ComfyUI, open a terminal in your `ComfyUI/custom_nodes/prompt_library` folder, and run:
+
+```sh
+git pull --ff-only origin main
+```
+
+Restart ComfyUI, then hard-refresh the browser (`Ctrl+Shift+R`, or `Cmd+Shift+R` on macOS). Run this update command whenever you want the latest changes; release ZIPs will remain unchanged. If Git reports local changes or diverging history, preserve your changes and resolve the message before continuing.
+
+**Installed from a release ZIP? One-time setup is required.** ZIP downloads do not contain Git history, so `git pull` cannot run directly in the extracted folder:
+
+1. Stop ComfyUI.
+2. Move the existing `prompt_library` extension folder to a backup location **outside** `ComfyUI/custom_nodes` so ComfyUI cannot load two copies. Keep any local customizations there.
+3. Open a terminal in `ComfyUI/custom_nodes` and run:
+   ```sh
+   git clone https://github.com/IAmThroot/Prompt-Library.git prompt_library
+   cd prompt_library
+   git pull --ff-only origin main
+   ```
+   Cloning already fetches the latest code; the pull verifies it is current and is the command to use for future updates.
+4. Restart ComfyUI and hard-refresh the browser.
+
+Your library is stored separately under `ComfyUI/user/prompt_library/`. Keep that directory intact; replacing the extension folder does not require removing your saved library.
+
 ### Requirements & Optional Dependencies
+
 
 - **Python**: 3.10+
 - **Pillow (`PIL`)**: Required for image reading and thumbnail generation (already included with ComfyUI).
@@ -111,14 +139,17 @@ Prompt Library is an extension and custom node for [ComfyUI](https://github.com/
 - Click **View image** to preview images in full resolution.
 - Click **Play media** to stream HTML5 videos or audio with native seek, playback, and volume controls.
 - Closing the viewer immediately stops playback and releases media decoders.
+- Scans and library data refreshes reload expanded galleries and workflow lists. Generation pagination restarts on a data refresh; checkbox selection changes preserve loaded gallery pages.
 
 ### 8. Settings, Backups & Recovery
 
 Click **Settings and backups** to configure:
-- **Capture Settings**: Toggle background capture, scan interval (seconds), hidden output folders, and symlink traversal.
+- **Capture Settings**: Toggle background capture, scan interval (seconds), hidden output files and folders, and symlink traversal. Disabling hidden capture skips future scans of hidden content; previously indexed records remain saved.
 - **Automatic Backups**: Toggle automated periodic backups, set backup interval (hours), and configure backup retention count (older scheduled backups are pruned automatically; manual and safety backups are preserved).
 - **Manual Backups**: Click **Back up now** to trigger an instant backup and download the resulting ZIP archive.
 - **Safe Restore**: Restore previous backups with one click. An automatic safety backup of the current library is created immediately prior to restoration.
+
+Closing a job progress dialog stops browser polling while the server continues the job. Check **Recent jobs** in **Settings and backups** for its status; reopen settings to refresh that list. Keeping the progress dialog open shows the normal completion and download options.
 
 ---
 

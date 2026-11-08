@@ -5,6 +5,27 @@ All notable changes to Prompt Library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Refresh expanded generation galleries and workflow lists when library data reloads, while preserving loaded gallery pages during selection-only rerenders.
+- Continue scanning remaining files when a source disappears or becomes inaccessible during thumbnail processing, recording a per-file diagnostic.
+- Apply the hidden capture setting to hidden filenames as well as hidden directories. Previously indexed records remain saved.
+- Stop browser job polling when progress dialogs close without cancelling server jobs or reopening completion dialogs afterward.
+- Validate explicit selections on the selection endpoint and return HTTP 400 for missing, malformed, or ambiguous selections. Preserve existing export defaults.
+
+### Documentation
+
+- Document repository-only updates: the Releases page and release ZIPs will no longer receive updates.
+- Add Git update instructions and a one-time migration from release ZIP installations to a Git checkout.
+- Explain gallery refresh behavior, hidden-file capture, and how to check jobs after closing progress dialogs.
+
+### Tests
+
+- Add regressions for gallery invalidation, job observation cancellation, disappearing preview sources, hidden filenames, and selection endpoint validation.
+- Automated checks passed: 91 Python tests and seven frontend tests; two additional HTTP integration tests were skipped because aiohttp was unavailable. Live ComfyUI checks were confirmed by the maintainer.
+
 ## [1.1.0] - 2026-11-03
 
 ### Security
